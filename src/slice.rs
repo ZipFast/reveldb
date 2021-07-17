@@ -2,6 +2,15 @@ use std::ops::Index;
 use std::cell::Cell;
 use std::cmp::{Ordering, min};
 
+
+/// Slice is a simple structure containing a reference into some external
+/// storage and a size. The user of a Slice mut ensure that the slice
+/// is not used after the corresponding external storage has been
+/// deallocated.
+///
+/// multiple threads can invoke read methods on a Slice without external
+/// synchronization, but if any of the threads may call a update method,
+/// all threads accessing the same Slice mut use external synchronization
 #[derive(Eq)]
 pub struct Slice {
 	data: Cell<&'static str>,
