@@ -1,0 +1,10 @@
+[package]
+name = "reveldb"
+version = "0.1.0"
+authors = ["zhangwenjum <2780898229@qq.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.4"
