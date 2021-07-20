@@ -1,4 +1,7 @@
 mod slice;
+mod memtable;
+mod skiplist;
+
 #[cfg(test)]
 mod tests {
     #[test]
