@@ -1,6 +1,7 @@
 mod slice;
 mod memtable;
 mod skiplist;
+mod random;
 
 #[cfg(test)]
 mod tests {

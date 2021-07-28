@@ -127,9 +127,7 @@ impl SkipList {
     fn contain(&self, key: &Vec<u8>) -> bool {
         let mut prev = vec![];
         let n = self.findGreaterOrEqual(key, &mut prev);
-        println!("key is {:?}, node is {:?}", key, unsafe {
-            
-        });
+        println!("key is {:?}, node is {:?}", key, unsafe {});
         if n != null_mut() && unsafe { key.to_vec() == n.as_ref().unwrap().key_ } {
             true
         } else {
@@ -146,5 +144,12 @@ mod tests {
         let mut list = SkipList::new();
         list.Insert(&"hello".as_bytes().to_vec());
         assert_eq!(list.contain(&"hello".as_bytes().to_vec()), true);
+    }
+
+    #[test]
+    fn test_insert_and_lookup() {
+        let N: i32 = 2000;
+        let R: i32 = 5000;
+        rand
     }
 }
