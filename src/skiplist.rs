@@ -67,8 +67,8 @@ impl<T: Ord> Node<T> {
 }
 
 mod test {
-    use crate::skiplist::K;
-    use std::cmp::Ordering;
+    use crate::skiplist::*;
+    use std::{cmp::Ordering, sync::Arc, thread::spawn};
     #[test]
     fn test_key() {
         let Minimum1 = K::<i32>::Minimum;
@@ -79,5 +79,17 @@ mod test {
         assert_eq!(Minimum1.cmp(&x), Ordering::Less);
         assert_eq!(x.cmp(&Minimum1), Ordering::Greater);
         assert_eq!(x.cmp(&y), Ordering::Greater);
+    }
+    #[test]
+    fn test_node() {
+        let node1 = Arc::new(Node::new(1, 4));
+        assert_eq!(node1.next(1), None);
+        let node1_clone = node1.clone();
+        let handle = spawn(move || {
+            node1_clone.set_next(1, NonNull::new(Box::into_raw(Box::new(Node::new(1, 4)))));
+        });
+        handle.join();
+        let node = node1.next(1).map(|x| unsafe { *(x.as_ptr()) }.key);
+        assert_eq!(node, Some(1));
     }
 }

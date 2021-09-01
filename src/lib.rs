@@ -2,6 +2,7 @@ mod slice;
 mod memtable;
 mod skiplist;
 mod random;
+mod arena;
 
 #[cfg(test)]
 mod tests {
