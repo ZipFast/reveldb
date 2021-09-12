@@ -1,269 +1,183 @@
-use std::cell::RefCell;
-use std::mem;
+use std::mem::size_of;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BLOCK_SIZE: usize = 4096;
+// a Vec has pointer and two usize field(cap and len)
+const POINTER_LENGTH: usize = size_of::<*mut u8>();
+const EXTRA_VEC_LEN: usize = POINTER_LENGTH + 2 * size_of::<usize>();
 
-pub trait Arena {
-    /// Return the start pointer to a newly allocated memory block of `size` bytes .
-    unsafe fn allocate<T>(&self, size: usize, align: usize) -> *mut T;
-
-    /// Return the size of memory that has been allocated.
-    fn memory_used(&self) -> usize;
-}
-
-struct Inner {
-    len: AtomicUsize,
-    cap: usize,
-    ptr: *mut u8,
-}
-
-#[derive(Clone)]
 pub struct Arena {
-    inner: Arc<Inner>,
+    alloc_ptr_: *mut u8,
+    alloc_bytes_remaining_: usize,
+    memory_usage_: AtomicUsize,
+    blocks_: Vec<Vec<u8>>,
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        // manully drop ArenaInner
-        if !self.ptr.is_null() {
-            unsafe {
-                let ptr = self.ptr as *mut u64;
-                let cap = self.cap / 8;
-                Vec::from_raw_parts(ptr, 0, cap);
-            }
+impl Arena {
+    pub fn new() -> Self {
+        Self {
+            alloc_ptr_: ptr::null_mut(),
+            alloc_bytes_remaining_: 0,
+            memory_usage_: AtomicUsize::new(0),
+            blocks_: Vec::new(),
         }
-    }
-}
-
-impl Arena for OffsetArena {
-    unsafe fn allocate<T>(&self, chunk: usize, align: usize) -> *mut T {
-        let offset = self.alloc(align, chunk);
-        self.get_mut(offset)
-    }
-
-    /// Return the size of memory that has been allocated.
-    fn memory_used(&self) -> usize {
-        self.inner.len.load(Ordering::SeqCst)
-    }
-}
-
-unsafe impl Send for OffsetArena {}
-unsafe impl Sync for OffsetArena {}
-
-impl OffsetArena {
-    // The real cap will be aligned with 8
-    pub fn with_capacity(cap: usize) -> Self {
-        let mut buf: Vec<u64> = Vec::with_capacity(cap / 8);
-        let ptr = buf.as_mut_ptr() as *mut u8;
-        let cap = buf.capacity() * 8;
-        mem::forget(buf);
-        OffsetArena {
-            inner: Arc::new(OffsetArenaInner {
-                len: AtomicUsize::new(1),
-                cap,
-                ptr,
-            }),
-        }
-    }
-
-    // Allocates `size` bytes aligned with `align`
-    fn alloc(&self, align: usize, size: usize) -> usize {
-        let align_mask = align - 1;
-        // Leave enough padding for align.
-        let size = size + align_mask;
-        let offset = self.inner.len.fetch_add(size, Ordering::SeqCst);
-        // (offset + align_mask) / align * align.
-        let ptr_offset = (offset + align_mask) & !align_mask;
-        assert!(
-            offset + size <= self.inner.cap,
-            "current {}, cap {}",
-            offset + size,
-            self.inner.cap
-        );
-        ptr_offset
-    }
-
-    // Returns a raw pointer with given arena offset
-    unsafe fn get_mut<N>(&self, offset: usize) -> *mut N {
-        if offset == 0 {
-            return ptr::null_mut();
-        }
-        self.inner.ptr.add(offset) as _
-    }
-}
-
-/// `BlockArena` is a memory pool for allocating and handling Node memory dynamically.
-pub struct BlockArena {
-    ptr: AtomicPtr<u8>,
-    bytes_remaining: AtomicUsize,
-    blocks: RefCell<Vec<Vec<u8>>>,
-    // Total memory usage of the arena.
-    memory_usage: AtomicUsize,
-}
-
-impl BlockArena {
-    fn allocate_fallback(&self, size: usize) -> *mut u8 {
-        if size > BLOCK_SIZE / 4 {
-            // Object is more than a quarter of our block size.  Allocate it separately
-            // to avoid wasting too much space in leftover bytes.
-            return self.allocate_new_block(size);
-        }
-        // create a new full block
-        let new_block_ptr = self.allocate_new_block(BLOCK_SIZE);
-        unsafe {
-            let ptr = new_block_ptr.add(size);
-            self.ptr.store(ptr, Ordering::Release);
-        };
-        self.bytes_remaining
-            .store(BLOCK_SIZE - size, Ordering::Release);
-        new_block_ptr
-    }
-
-    fn allocate_new_block(&self, block_bytes: usize) -> *mut u8 {
-        let mut new_block = vec![0; block_bytes];
-        let p = new_block.as_mut_ptr();
-        self.blocks.borrow_mut().push(new_block);
-        self.memory_usage.fetch_add(block_bytes, Ordering::Relaxed);
-        p
-    }
-}
-
-impl Arena for BlockArena {
-    unsafe fn allocate<T>(&self, chunk: usize, align: usize) -> *mut T {
-        assert!(chunk > 0);
-        let ptr_size = mem::size_of::<usize>();
-        // the align should be a pow(2)
-        assert_eq!(align & (align - 1), 0);
-
-        let slop = {
-            let current_mod = self.ptr.load(Ordering::Acquire) as usize & (align - 1);
-            if current_mod == 0 {
-                0
-            } else {
-                align - current_mod
-            }
-        };
-        let needed = chunk + slop;
-        let result = if needed <= self.bytes_remaining.load(Ordering::Acquire) {
-            // padding to align
-            let p = self.ptr.load(Ordering::Acquire).add(slop);
-            self.ptr.store(p.add(chunk), Ordering::Release);
-            self.bytes_remaining.fetch_sub(needed, Ordering::SeqCst);
-            p
-        } else {
-            self.allocate_fallback(chunk)
-        };
-        assert_eq!(
-            result as usize & (align - 1),
-            0,
-            "allocated memory should be aligned with {}",
-            ptr_size
-        );
-        result as *mut T
     }
 
     #[inline]
-    fn memory_used(&self) -> usize {
-        self.memory_usage.load(Ordering::Acquire)
+    pub fn allocate(&mut self, bytes: usize) -> *mut u8 {
+        assert!(bytes > 0);
+        if bytes <= self.alloc_bytes_remaining_ {
+            let result = self.alloc_ptr_;
+            unsafe {
+                self.alloc_ptr_ = self.alloc_ptr_.add(bytes);
+            }
+            self.alloc_bytes_remaining_ -= bytes;
+            result
+        } else {
+            self.allocate_fallback(bytes)
+        }
+    }
+
+    pub fn allocate_aligned(&mut self, bytes: usize) -> *mut u8 {
+        let align = if POINTER_LENGTH > 8 {
+            POINTER_LENGTH
+        } else {
+            8
+        };
+
+        let current_mod = self.alloc_ptr_ as usize & (align - 1);
+        let slop = if current_mod == 0 {
+            0
+        } else {
+            align - current_mod
+        };
+
+        let needed = bytes + slop;
+        if needed <= self.alloc_bytes_remaining_ {
+            let result = unsafe { self.alloc_ptr_.add(slop) };
+            self.alloc_ptr_ = unsafe { self.alloc_ptr_.add(needed) };
+            self.alloc_bytes_remaining_ -= needed;
+            result
+        } else {
+            self.allocate_fallback(bytes)
+        }
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        self.memory_usage_.load(Ordering::SeqCst)
+    }
+
+    fn allocate_fallback(&mut self, n: usize) -> *mut u8 {
+        if n > BLOCK_SIZE / 4 {
+            self.allocate_new_block(n)
+        } else {
+            self.alloc_ptr_ = self.allocate_new_block(BLOCK_SIZE);
+            self.alloc_bytes_remaining_ = BLOCK_SIZE;
+            let result = self.alloc_ptr_;
+            unsafe {
+                self.alloc_ptr_ = self.alloc_ptr_.add(n);
+            }
+            self.alloc_bytes_remaining_ -= n;
+            result
+        }
+    }
+
+    fn allocate_new_block(&mut self, block_bytes: usize) -> *mut u8 {
+        let mut v: Vec<u8> = Vec::with_capacity(block_bytes);
+        unsafe {
+            v.set_len(block_bytes);
+        }
+        let r = v.as_mut_ptr();
+        self.blocks_.push(v);
+        self.memory_usage_
+            .fetch_add(block_bytes + EXTRA_VEC_LEN, Ordering::SeqCst);
+        r
+    }
+}
+
+impl Default for Arena {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::arena::{Arena, BlockArena, BLOCK_SIZE};
-    use crate::random::*;
-    use std::ptr;
-    use std::sync::atomic::Ordering;
+mod test {
+    use std::mem;
 
+    use crate::random::Random;
+
+    use super::*;
     #[test]
-    fn test_new_arena() {
-        let a = BlockArena::default();
-        assert_eq!(a.memory_used(), 0);
-        assert_eq!(a.bytes_remaining.load(Ordering::Acquire), 0);
-        assert_eq!(a.ptr.load(Ordering::Acquire), ptr::null_mut());
-        assert_eq!(a.blocks.borrow().len(), 0);
+    fn test_empty() {
+        let arena = Arena::new();
     }
 
     #[test]
-    #[should_panic]
-    fn test_allocate_empty_should_panic() {
-        let a = BlockArena::default();
-        unsafe { a.allocate::<u8>(0, 0) };
-    }
-
-    #[test]
-    fn test_allocate_new_block() {
-        let a = BlockArena::default();
-        let mut expect_size = 0;
-        for (i, size) in [1, 128, 256, 1000, 4096, 10000].iter().enumerate() {
-            a.allocate_new_block(*size);
-            expect_size += *size;
-            assert_eq!(a.memory_used(), expect_size, "memory used should match");
-            assert_eq!(
-                a.blocks.borrow().len(),
-                i + 1,
-                "number of blocks should match"
-            )
-        }
-    }
-
-    #[test]
-    fn test_allocate_fallback() {
-        let a = BlockArena::default();
-        assert_eq!(a.memory_used(), 0);
-        a.allocate_fallback(1);
-        assert_eq!(a.memory_used(), BLOCK_SIZE);
-        assert_eq!(a.bytes_remaining.load(Ordering::Acquire), BLOCK_SIZE - 1);
-        a.allocate_fallback(BLOCK_SIZE / 4 + 1);
-        assert_eq!(a.memory_used(), BLOCK_SIZE + BLOCK_SIZE / 4 + 1);
-    }
-
-    #[test]
-    fn test_allocate_mixed() {
-        let a = BlockArena::default();
-        let mut allocated = vec![];
-        let mut allocated_size = 0;
-        let n = 10000;
-        let mut r = rand::thread_rng();
-        for i in 0..n {
-            let size = if i % (n / 10) == 0 {
-                if i == 0 {
-                    continue;
-                }
-                i
+    fn test_simple() {
+        let mut allocated: Vec<(usize, *mut u8)> = Vec::new();
+        let mut arena = Arena::new();
+        let N = 100000;
+        let mut bytes = 0;
+        let rnd = Random::new(301);
+        for i in 0..N {
+            let mut s;
+            if i % (N / 10) == 0 {
+                s = i;
             } else {
-                if i == 1 {
-                    1
+                s = if rnd.one_in(4000) {
+                    rnd.uniform(6000)
                 } else {
-                    r.gen_range(1, i)
-                }
-            };
-            let ptr = unsafe { a.allocate::<u8>(size, 8) };
-            unsafe {
-                for j in 0..size {
-                    let np = ptr.add(j);
-                    (*np) = (j % 256) as u8;
+                    if rnd.one_in(10) {
+                        rnd.uniform(100)
+                    } else {
+                        rnd.uniform(20)
+                    }
+                };
+            }
+            if s == 0 {
+                // Our arena disallows size 0 allocation
+                s = 1;
+            }
+            let r;
+            if rnd.one_in(10) {
+                r = arena.allocate_aligned(s as usize);
+            } else {
+                r = arena.allocate(s as usize);
+            }
+            for b in 0..s {
+                // Fill the ''i'' th allocation with a known bit pattern
+                unsafe {
+                    std::ptr::write::<u8>(r.add(b as usize), (i % 256) as u8);
                 }
             }
-            allocated_size += size;
-            allocated.push((ptr, size));
-            assert!(
-                a.memory_used() >= allocated_size,
-                "the memory used {} should be greater or equal to expecting allocated {}",
-                a.memory_used(),
-                allocated_size
+            bytes += s;
+            allocated.push((s as usize, r));
+            println!("{} {} {}", s, bytes, i);
+            println!(
+                "memory_usage: {} bytes: {}",
+                arena.memory_usage(),
+                bytes as f64 * 1.10
             );
+            assert!(arena.memory_usage() >= bytes as usize);
+            if i > N / 10 {
+                println!(
+                    "memory_usage: {} bytes: {}",
+                    arena.memory_usage(),
+                    bytes as f64 * 1.10
+                );
+                assert!(arena.memory_usage() as f64 <= (f64::from(bytes) * 1.10));
+            }
         }
-        for (ptr, size) in allocated.iter() {
-            unsafe {
-                for i in 0..*size {
-                    let p = ptr.add(i);
-                    assert_eq!(*p, (i % 256) as u8);
+        let mut i = 0;
+        for (num_bytes, p) in allocated {
+            for b in 0..num_bytes {
+                unsafe {
+                    assert_eq!(std::ptr::read::<u8>(p.add(b)) & 0xff, (i % 256) as u8);
                 }
             }
+            i += 1;
         }
     }
 }
